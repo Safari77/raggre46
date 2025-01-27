@@ -1,0 +1,30 @@
+[package]
+name = "raggre"
+version = "0.4.2"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.27", features = ["derive"] }
+rand = "0.8.5"
+
+[[bin]]
+name = "raggre4"
+path = "src/raggre4.rs"
+
+[[bin]]
+name = "raggre6"
+path = "src/raggre6.rs"
+
+[[bin]]
+name = "ruran4"
+path = "src/ruran4.rs"
+
+[[bin]]
+name = "ruran6"
+path = "src/ruran6.rs"
+
+[profile.release]
+opt-level = 3
+debug = true
+lto = true # Enable Link Time Optimization
+
