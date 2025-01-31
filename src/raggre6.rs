@@ -84,23 +84,18 @@ fn aggregate_netblocks(mut netblocks: Vec<Netblock>) -> Vec<Netblock> {
 
         while let Some(mut current) = iter.next() {
             // Keep merging or skipping as long as possible
-            loop {
-                match iter.peek() {
-                    Some(next) => {
-                        if current.contains(next) {
-                            // Next is contained => skip
-                            iter.next();
-                            changed = true;
-                        } else if let Some(new_agg) = current.aggregate(next) {
-                            // Merge => aggregator changes, consume `next`
-                            iter.next();
-                            current = new_agg;
-                            changed = true;
-                        } else {
-                            break;
-                        }
-                    }
-                    None => break,
+            while let Some(next) = iter.peek() {
+                if current.contains(next) {
+                    // Next is contained => skip
+                    iter.next();
+                    changed = true;
+                } else if let Some(new_agg) = current.aggregate(next) {
+                    // Merge => aggregator changes, consume `next`
+                    iter.next();
+                    current = new_agg;
+                    changed = true;
+                } else {
+                    break;
                 }
             }
             result.push(current);
@@ -147,14 +142,11 @@ fn main() {
     };
 
     let mut netblocks = Vec::new();
-    for line_result in input.lines() {
-        if let Ok(line) = line_result {
-            if let Some(nb) = parse_netblock(&line, ignore_invalid) {
-                netblocks.push(nb);
-            }
+    for line in input.lines().map_while(Result::ok) {
+        if let Some(nb) = parse_netblock(&line, ignore_invalid) {
+            netblocks.push(nb);
         }
     }
-
     let aggregated = aggregate_netblocks(netblocks);
 
     for nb in aggregated {
