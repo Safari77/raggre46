@@ -3,15 +3,15 @@ use std::env;
 use std::net::Ipv4Addr;
 
 fn generate_random_ipv4() -> Ipv4Addr {
-    let mut rng = rand::thread_rng();
-    Ipv4Addr::new(rng.gen(), rng.gen(), rng.gen(), rng.gen())
+    let mut rng = rand::rng();
+    Ipv4Addr::new(rng.random(), rng.random(), rng.random(), rng.random())
 }
 
 fn generate_random_ipv4_netblock() -> (Ipv4Addr, u8) {
-    let mut rng = rand::thread_rng();
-    let prefix_len = rng.gen_range(16..=31);
+    let mut rng = rand::rng();
+    let prefix_len = rng.random_range(16..=31);
     let mask = (!0u32) << (32 - prefix_len);
-    let base_address = rng.gen::<u32>() & mask;
+    let base_address = rng.random::<u32>() & mask;
     let ip = Ipv4Addr::from(base_address);
     (ip, prefix_len)
 }

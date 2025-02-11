@@ -3,24 +3,24 @@ use std::env;
 use std::net::Ipv6Addr;
 
 fn generate_random_ipv6() -> Ipv6Addr {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     Ipv6Addr::new(
-        rng.gen(),
-        rng.gen(),
-        rng.gen(),
-        rng.gen(),
-        rng.gen(),
-        rng.gen(),
-        rng.gen(),
-        rng.gen(),
+        rng.random(),
+        rng.random(),
+        rng.random(),
+        rng.random(),
+        rng.random(),
+        rng.random(),
+        rng.random(),
+        rng.random(),
     )
 }
 
 fn generate_random_ipv6_netblock() -> (Ipv6Addr, u8) {
-    let mut rng = rand::thread_rng();
-    let prefix_len = rng.gen_range(32..=127);
+    let mut rng = rand::rng();
+    let prefix_len = rng.random_range(32..=127);
     let mask = (!0u128) << (128 - prefix_len);
-    let base_address = rng.gen::<u128>() & mask;
+    let base_address = rng.random::<u128>() & mask;
     let ip = Ipv6Addr::from(base_address);
     (ip, prefix_len)
 }
