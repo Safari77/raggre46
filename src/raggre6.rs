@@ -153,4 +153,3 @@ fn main() {
         println!("{}/{}", nb.network, nb.prefix_len);
     }
 }
-
