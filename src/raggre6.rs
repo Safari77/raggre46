@@ -1,4 +1,6 @@
 use clap::{Arg, Command};
+use std::error::Error;
+use std::fmt;
 use std::io::{self, BufRead};
 use std::net::Ipv6Addr;
 use std::str::FromStr;
@@ -49,68 +51,110 @@ impl Netblock {
             None
         }
     }
+
+    /// Check if an IPv6 address is canonical for its prefix (all bits beyond prefix are zero)
+    fn is_canonical(&self) -> bool {
+        let shift = 128 - self.prefix_len;
+        let bits = u128::from(self.network);
+        let masked = (bits >> shift) << shift;
+        masked == bits
+    }
 }
 
-/// Parse a line into a `Netblock`. E.g. "2001:db8::/48" or "fe80::".
-fn parse_netblock(line: &str, ignore_invalid: bool) -> Option<Netblock> {
-    if let Some((ip_str, prefix_str)) = line.split_once('/') {
-        if let (Ok(ip), Ok(prefix)) = (Ipv6Addr::from_str(ip_str), prefix_str.parse::<u8>()) {
+/// Custom error for parsing netblocks
+#[derive(Debug)]
+struct NetblockParseError;
+
+impl fmt::Display for NetblockParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid IPv6 netblock format")
+    }
+}
+
+impl Error for NetblockParseError {}
+
+impl FromStr for Netblock {
+    type Err = NetblockParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some((ip_str, prefix_str)) = s.split_once('/') {
+            let ip = Ipv6Addr::from_str(ip_str).map_err(|_| NetblockParseError)?;
+            let prefix = prefix_str.parse::<u8>().map_err(|_| NetblockParseError)?;
+
             if prefix <= 128 {
-                let bits = u128::from(ip);
-                let shift = 128 - prefix;
-                let masked = (bits >> shift) << shift;
-                if ignore_invalid && bits != masked {
-                    return None;
-                }
-                return Some(Netblock::new(ip, prefix));
+                // Create the netblock but don't normalize the address yet
+                return Ok(Self {
+                    network: ip,
+                    prefix_len: prefix,
+                });
+            }
+        } else {
+            // No prefix => assume /128
+            if let Ok(ip) = Ipv6Addr::from_str(s) {
+                return Ok(Self {
+                    network: ip,
+                    prefix_len: 128,
+                });
             }
         }
-    } else if let Ok(ip) = Ipv6Addr::from_str(line) {
-        // No prefix => assume /128
-        return Some(Netblock::new(ip, 128));
+        Err(NetblockParseError)
     }
-    None
+}
+
+impl fmt::Display for Netblock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.network, self.prefix_len)
+    }
 }
 
 /// Repeatedly merge netblocks until stable (no more merges/containments).
 fn aggregate_netblocks(mut netblocks: Vec<Netblock>) -> Vec<Netblock> {
+    if netblocks.is_empty() {
+        return netblocks;
+    }
+
+    let mut result = Vec::with_capacity(netblocks.len());
+
     loop {
         // Sort for consistent iteration
         netblocks.sort();
 
         let mut changed = false;
-        let mut result = Vec::new();
-        let mut iter = netblocks.into_iter().peekable();
+        result.clear();
 
-        while let Some(mut current) = iter.next() {
-            // Keep merging or skipping as long as possible
-            while let Some(next) = iter.peek() {
-                if current.contains(next) {
-                    // Next is contained => skip
-                    iter.next();
-                    changed = true;
-                } else if let Some(new_agg) = current.aggregate(next) {
-                    // Merge => aggregator changes, consume `next`
-                    iter.next();
-                    current = new_agg;
-                    changed = true;
-                } else {
-                    break;
-                }
+        let mut iter = netblocks.iter();
+        let mut current = iter.next().unwrap().clone();
+
+        // Single pass that merges and contains
+        for next in iter {
+            if current.contains(next) {
+                // Next is contained => skip
+                changed = true;
+            } else if let Some(new_agg) = current.aggregate(next) {
+                // Merge => aggregator changes
+                current = new_agg;
+                changed = true;
+            } else {
+                // Can't merge or contain => push current and move on
+                result.push(current);
+                current = next.clone();
             }
-            result.push(current);
         }
+
+        // Don't forget the last element
+        result.push(current);
 
         // If no merges or containment happened, we're done
         if !changed {
             return result;
         }
-        // Otherwise, repeat
-        netblocks = result;
+
+        // Swap vectors to avoid allocation
+        std::mem::swap(&mut netblocks, &mut result);
     }
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn Error>> {
     let matches = Command::new("IPv6 Netblock Aggregator")
         .version(env!("CARGO_PKG_VERSION"))
         .author("Sami Farin")
@@ -130,26 +174,46 @@ fn main() {
         .get_matches();
 
     let ignore_invalid = matches.get_flag("ignore-invalid");
-    let input: Box<dyn BufRead> = if let Some(file) = matches.get_one::<String>("input") {
-        if let Ok(file) = std::fs::File::open(file) {
-            Box::new(io::BufReader::new(file))
-        } else {
-            eprintln!("Error: Could not open file '{}'.", file);
-            return;
-        }
-    } else {
-        Box::new(io::BufReader::new(io::stdin()))
+
+    // Create the reader based on input arg
+    let mut input: Box<dyn BufRead> = match matches.get_one::<String>("input") {
+        Some(file) => Box::new(io::BufReader::new(std::fs::File::open(file)?)),
+        None => Box::new(io::BufReader::new(io::stdin())),
     };
 
+    // Parse input lines into netblocks, handling non-UTF8 content
     let mut netblocks = Vec::new();
-    for line in input.lines().map_while(Result::ok) {
-        if let Some(nb) = parse_netblock(&line, ignore_invalid) {
-            netblocks.push(nb);
-        }
-    }
-    let aggregated = aggregate_netblocks(netblocks);
+    let mut buf = Vec::new();
 
-    for nb in aggregated {
-        println!("{}/{}", nb.network, nb.prefix_len);
+    // Read lines as raw bytes rather than UTF-8 strings
+    loop {
+        buf.clear();
+        let bytes_read = input.read_until(b'\n', &mut buf)?;
+        if bytes_read == 0 {
+            break; // End of input
+        }
+
+        // Try to convert to string, skip if invalid UTF-8
+        if let Ok(line) = String::from_utf8(buf.clone()) {
+            let line = line.trim();
+            if !line.is_empty() {
+                if let Ok(nb) = line.parse::<Netblock>() {
+                    // Check if the netblock is canonical when ignore_invalid is set
+                    if !ignore_invalid || nb.is_canonical() {
+                        // Always normalize the network address
+                        netblocks.push(Netblock::new(nb.network, nb.prefix_len));
+                    }
+                }
+            }
+        }
+        // If invalid UTF-8, just continue to the next line
     }
+
+    // Aggregate and output
+    let aggregated = aggregate_netblocks(netblocks);
+    for nb in aggregated {
+        println!("{}", nb);
+    }
+
+    Ok(())
 }
