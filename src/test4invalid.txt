@@ -1,0 +1,6 @@
+# Test Case 3: Non-canonical addresses (for --ignore-invalid testing)                                                                  
+172.16.1.5/24                                                                                                                          
+172.16.2.0/24                                                                                                                          
+172.16.3.128/25                                                                                                                        
+172.16.3.130/25                                                                                                                        
+# With --ignore-invalid: Expected result: 172.16.2.0/24, 172.16.3.128/25

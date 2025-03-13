@@ -1,0 +1,80 @@
+# Test Case 1: Redundant networks (similar to IPv4 test case 1)
+2001:db8:1::/66
+2001:db8:1::4000:0:0:0/66
+2001:db8:1::8000:0:0:0/66
+2001:db8:1::c000:0:0:0/66
+2001:db8:1::/65
+2001:db8:1::8000:0:0:0/65
+2001:db8:1::/65
+2001:db8:1::8000:0:0:0/65
+# Expected result: 2001:db8:1::/64 (all networks should aggregate into a single /64)
+
+# Test Case 2: Mixed prefix lengths with some overlaps
+2001:db8:2::/64
+2001:db8:2:1::/64
+2001:db8:2:2::/63
+2001:db8:2:4::/62
+2001:db8:2:8::/64
+2001:db8:2:9::/64
+# Expected result: 2001:db8:2::/62, 2001:db8:2:4::/62, 2001:db8:2:8::/63
+
+# Test Case 4: Disjoint networks that can't be aggregated
+2001:db8:4:1::/64
+2001:db8:4:3::/64
+2001:db8:4:5::/64
+2001:db8:4:7::/64
+# Expected result: Same as input (no aggregation possible)
+
+# Test Case 5: Nested networks with multiple levels
+2001:db8:5::/48
+2001:db8:5:1::/64
+2001:db8:5:2::/64
+2001:db8:5:3::/64
+2001:db8:5:3:8000::/65
+2001:db8:5:3:4000::/66
+2001:db8:5:3::/66
+# Expected result: 2001:db8:5::/48 (all networks contained in the /48)
+
+# Test Case 6: Complete series of adjacent networks
+2001:db8:6:10::/64
+2001:db8:6:11::/64
+2001:db8:6:12::/64
+2001:db8:6:13::/64
+2001:db8:6:14::/64
+2001:db8:6:15::/64
+2001:db8:6:16::/64
+2001:db8:6:17::/64
+# Expected result: 2001:db8:6:10::/61 (eight /64s aggregate to one /61)
+
+# Test Case 7: Invalid prefix length (for error handling testing)
+2001:db8:7::/129
+2001:db8:7::/-1
+# These should be skipped as invalid
+
+# Test Case 8: Invalid IP format (for error handling testing)
+2001:zzzz:1::/64
+2001:db8:1:/64
+# These should be skipped as invalid
+
+# Test Case 9: Networks with non-standard spacing
+2001:db8:8:100::/64
+
+2001:db8:8:101::/64
+  2001:db8:8:102::/64
+	2001:db8:8:103::/64
+# Expected result: 2001:db8:8:100::/62 (whitespace should be handled correctly)
+
+# Test Case 10: Different IPv6 representations
+2001:db8:9::/64
+2001:db8:9:0::/64
+2001:0db8:0009:0000::/64
+# Expected result: Single network 2001:db8:9::/64 (all representations point to the same network)
+
+# Test Case 11: Link-local and special addresses
+fe80::/64
+fe80:1::/64
+fe80:2::/64
+fe80:3::/64
+::1/128
+::/128
+# Expected result: fe80::/62, ::1/128, ::/128

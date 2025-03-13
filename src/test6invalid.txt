@@ -1,0 +1,6 @@
+# Test Case 3: Non-canonical addresses (for --ignore-invalid testing)                                                                  
+2001:db8:3:1::5/64                                                                                                                     
+2001:db8:3:2::/64                                                                                                                      
+2001:db8:3:3:8000::/65                                                                                                                 
+2001:db8:3:3:8000::10/65                                                                                                               
+# With --ignore-invalid: Expected result: 2001:db8:3:2::/64, 2001:db8:3:3:8000::/65

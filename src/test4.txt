@@ -1,0 +1,74 @@
+# Test Case 1: Redundant networks
+10.1.0.0/18
+10.1.64.0/18
+10.1.128.0/18
+10.1.192.0/18
+10.1.0.0/17
+10.1.128.0/17
+10.1.0.0/17
+10.1.128.0/17
+# Expected result: 10.1.0.0/16 (all networks should aggregate into a single /16)
+
+# Test Case 2: Mixed prefix lengths with some overlaps
+192.168.0.0/24
+192.168.1.0/24
+192.168.2.0/23
+192.168.4.0/22
+192.168.8.0/24
+192.168.9.0/24
+# Expected result: 192.168.0.0/22, 192.168.4.0/22, 192.168.8.0/23
+
+# Test Case 4: Disjoint networks that can't be aggregated
+10.0.1.0/24
+10.0.3.0/24
+10.0.5.0/24
+10.0.7.0/24
+# Expected result: Same as input (no aggregation possible)
+
+# Test Case 5: Nested networks with multiple levels
+172.20.0.0/16
+172.20.1.0/24
+172.20.2.0/24
+172.20.3.0/24
+172.20.3.128/25
+172.20.3.64/26
+172.20.3.0/26
+# Expected result: 172.20.0.0/16 (all networks contained in the /16)
+
+# Test Case 6: Complete series of adjacent networks
+10.5.0.0/24
+10.5.1.0/24
+10.5.2.0/24
+10.5.3.0/24
+10.5.4.0/24
+10.5.5.0/24
+10.5.6.0/24
+10.5.7.0/24
+# Expected result: 10.5.0.0/21 (eight /24s aggregate to one /21)
+
+# Test Case 7: Invalid prefix length (for error handling testing)
+10.10.10.0/33
+10.10.10.0/-1
+# These should be skipped as invalid
+
+# Test Case 8: Invalid IP format (for error handling testing)
+999.168.1.0/24
+192.168.1/24
+# These should be skipped as invalid
+
+# Test Case 9: Networks with non-standard spacing
+10.100.0.0/24
+
+10.100.1.0/24
+  10.100.2.0/24
+	10.100.3.0/24
+# Expected result: 10.100.0.0/22 (whitespace should be handled correctly)
+
+# Test Case 10: Mixture of aggregatable and non-aggregatable networks
+10.200.0.0/24
+10.200.1.0/24
+10.200.4.0/24
+10.200.5.0/24
+10.200.10.0/24
+10.200.11.0/24
+# Expected result: 10.200.0.0/23, 10.200.4.0/23, 10.200.10.0/23
