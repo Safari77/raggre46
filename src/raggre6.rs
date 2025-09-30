@@ -5,7 +5,7 @@ use std::io::{self, BufRead};
 use std::net::Ipv6Addr;
 use std::str::FromStr;
 
-#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
 struct Netblock {
     network: Ipv6Addr,
     prefix_len: u8,
@@ -13,6 +13,7 @@ struct Netblock {
 
 impl Netblock {
     /// Create a new `Netblock`, zeroing out bits beyond `prefix_len`.
+    #[inline]
     fn new(network: Ipv6Addr, prefix_len: u8) -> Self {
         // Shift-based masking
         let shift = 128 - prefix_len;
@@ -25,6 +26,7 @@ impl Netblock {
     }
 
     /// True if `other` is fully contained in `self`.
+    #[inline]
     fn contains(&self, other: &Netblock) -> bool {
         let shift = 128 - self.prefix_len;
         ((u128::from(self.network) ^ u128::from(other.network)) >> shift) == 0
@@ -32,6 +34,7 @@ impl Netblock {
     }
 
     /// True if both have the same prefix_len and differ only in the last bit of that prefix.
+    #[inline]
     fn aggregateable_with(&self, other: &Netblock) -> bool {
         if self.prefix_len != other.prefix_len {
             return false;
@@ -43,6 +46,7 @@ impl Netblock {
     }
 
     /// Merge two siblings into a single netblock with prefix_len - 1, if possible.
+    #[inline]
     fn aggregate(&self, other: &Netblock) -> Option<Netblock> {
         if self.aggregateable_with(other) {
             // We create the bigger block by using `self.network` and prefix_len - 1
@@ -53,6 +57,7 @@ impl Netblock {
     }
 
     /// Check if an IPv6 address is canonical for its prefix (all bits beyond prefix are zero)
+    #[inline]
     fn is_canonical(&self) -> bool {
         let shift = 128 - self.prefix_len;
         let bits = u128::from(self.network);
@@ -80,9 +85,7 @@ impl FromStr for Netblock {
         if let Some((ip_str, prefix_str)) = s.split_once('/') {
             let ip = Ipv6Addr::from_str(ip_str).map_err(|_| NetblockParseError)?;
             let prefix = prefix_str.parse::<u8>().map_err(|_| NetblockParseError)?;
-
             if prefix <= 128 {
-                // Create the netblock but don't normalize the address yet
                 return Ok(Self {
                     network: ip,
                     prefix_len: prefix,
@@ -107,50 +110,60 @@ impl fmt::Display for Netblock {
     }
 }
 
-/// Repeatedly merge netblocks until stable (no more merges/containments).
+/// Merge netblocks until no more merges are possible.
 fn aggregate_netblocks(mut netblocks: Vec<Netblock>) -> Vec<Netblock> {
-    if netblocks.is_empty() {
+    if netblocks.len() <= 1 {
         return netblocks;
     }
 
-    let mut result = Vec::with_capacity(netblocks.len());
+    // Sort once at the start
+    netblocks.sort_unstable();
 
+    // First pass: remove contained netblocks
+    let mut deduped = Vec::with_capacity(netblocks.len());
+    let mut prev = netblocks[0];
+    
+    for &current in &netblocks[1..] {
+        if !prev.contains(&current) {
+            deduped.push(prev);
+            prev = current;
+        }
+        // If contained, skip current and keep prev
+    }
+    deduped.push(prev);
+
+    // Second pass: iteratively aggregate siblings
     loop {
-        // Sort for consistent iteration
-        netblocks.sort();
-
+        let mut result = Vec::with_capacity(deduped.len());
         let mut changed = false;
-        result.clear();
+        let mut i = 0;
 
-        let mut iter = netblocks.iter();
-        let mut current = iter.next().unwrap().clone();
-
-        // Single pass that merges and contains
-        for next in iter {
-            if current.contains(next) {
-                // Next is contained => skip
+        while i < deduped.len() {
+            let current = deduped[i];
+            
+            // Try to aggregate with next element
+            if i + 1 < deduped.len()
+                && let Some(aggregated) = current.aggregate(&deduped[i + 1])
+            {
+                result.push(aggregated);
                 changed = true;
-            } else if let Some(new_agg) = current.aggregate(next) {
-                // Merge => aggregator changes
-                current = new_agg;
-                changed = true;
-            } else {
-                // Can't merge or contain => push current and move on
-                result.push(current);
-                current = next.clone();
+                i += 2; // Skip both elements
+                continue;
             }
+            
+            result.push(current);
+            i += 1;
         }
 
-        // Don't forget the last element
-        result.push(current);
-
-        // If no merges or containment happened, we're done
         if !changed {
             return result;
         }
 
-        // Swap vectors to avoid allocation
-        std::mem::swap(&mut netblocks, &mut result);
+        // Swap for next iteration - avoids reallocation
+        std::mem::swap(&mut deduped, &mut result);
+        
+        // Re-sort only if we made changes
+        deduped.sort_unstable();
     }
 }
 
@@ -181,11 +194,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         None => Box::new(io::BufReader::new(io::stdin())),
     };
 
-    // Parse input lines into netblocks, handling non-UTF8 content
+    // Parse input lines into netblocks
     let mut netblocks = Vec::new();
     let mut buf = Vec::new();
 
-    // Read lines as raw bytes rather than UTF-8 strings
+    // Read lines as raw bytes to handle non-UTF8 content
     loop {
         buf.clear();
         let bytes_read = input.read_until(b'\n', &mut buf)?;
@@ -196,14 +209,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Try to convert to string, skip if invalid UTF-8
         if let Ok(line) = String::from_utf8(buf.clone()) {
             let line = line.trim();
-            if !line.is_empty() {
-                if let Ok(nb) = line.parse::<Netblock>() {
-                    // Check if the netblock is canonical when ignore_invalid is set
-                    if !ignore_invalid || nb.is_canonical() {
-                        // Always normalize the network address
-                        netblocks.push(Netblock::new(nb.network, nb.prefix_len));
-                    }
-                }
+            if !line.is_empty()
+                && let Ok(nb) = line.parse::<Netblock>()
+                && (!ignore_invalid || nb.is_canonical())
+            {
+                netblocks.push(Netblock::new(nb.network, nb.prefix_len));
             }
         }
         // If invalid UTF-8, just continue to the next line
