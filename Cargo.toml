@@ -27,4 +27,5 @@ path = "src/ruran6.rs"
 opt-level = 3
 debug = true
 lto = true # Enable Link Time Optimization
-
+codegen-units = 1
+panic = "abort"

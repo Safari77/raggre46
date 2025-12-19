@@ -18,10 +18,7 @@ impl Netblock {
         let shift = 32 - prefix_len;
         let bits = u32::from(network);
         let masked = (bits >> shift) << shift;
-        Self {
-            network: Ipv4Addr::from(masked),
-            prefix_len,
-        }
+        Self { network: Ipv4Addr::from(masked), prefix_len }
     }
 
     /// Return true if `other` is a subnet of `self`.
@@ -86,18 +83,12 @@ impl FromStr for Netblock {
             let prefix = prefix_str.parse::<u8>().map_err(|_| NetblockParseError)?;
 
             if prefix <= 32 {
-                return Ok(Self {
-                    network: ip,
-                    prefix_len: prefix,
-                });
+                return Ok(Self { network: ip, prefix_len: prefix });
             }
         } else {
             // No /prefix => assume /32
             if let Ok(ip) = Ipv4Addr::from_str(s) {
-                return Ok(Self {
-                    network: ip,
-                    prefix_len: 32,
-                });
+                return Ok(Self { network: ip, prefix_len: 32 });
             }
         }
         Err(NetblockParseError)
@@ -122,7 +113,7 @@ fn aggregate_netblocks(mut netblocks: Vec<Netblock>) -> Vec<Netblock> {
     // First pass: remove contained netblocks
     let mut deduped = Vec::with_capacity(netblocks.len());
     let mut prev = netblocks[0];
-    
+
     for &current in &netblocks[1..] {
         if !prev.contains(&current) {
             deduped.push(prev);
@@ -140,7 +131,7 @@ fn aggregate_netblocks(mut netblocks: Vec<Netblock>) -> Vec<Netblock> {
 
         while i < deduped.len() {
             let current = deduped[i];
-            
+
             // Try to aggregate with next element
             if i + 1 < deduped.len()
                 && let Some(aggregated) = current.aggregate(&deduped[i + 1])
@@ -150,7 +141,7 @@ fn aggregate_netblocks(mut netblocks: Vec<Netblock>) -> Vec<Netblock> {
                 i += 2; // Skip both elements
                 continue;
             }
-            
+
             result.push(current);
             i += 1;
         }
@@ -161,7 +152,7 @@ fn aggregate_netblocks(mut netblocks: Vec<Netblock>) -> Vec<Netblock> {
 
         // Swap for next iteration - avoids reallocation
         std::mem::swap(&mut deduped, &mut result);
-        
+
         // Re-sort only if we made changes
         deduped.sort_unstable();
     }
