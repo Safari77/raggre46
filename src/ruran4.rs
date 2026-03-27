@@ -17,6 +17,11 @@ fn generate_random_ipv4_netblock() -> (Ipv4Addr, u8) {
 }
 
 fn main() {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         eprintln!("Usage: {} <number_of_addresses>", args[0]);
