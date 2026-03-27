@@ -91,8 +91,15 @@ trait Aggregateable: Ord + Copy + fmt::Display {
     /// Returns None if already at maximum prefix length.
     fn split_halves(&self) -> Option<(Self, Self)>;
 
-    /// Format as an IP range string "start-end".
-    fn display_range(&self) -> String;
+    /// Format just the first address of this prefix.
+    fn display_start(&self) -> String;
+
+    /// Format just the last address of this prefix.
+    fn display_end(&self) -> String;
+
+    /// Return true if the last address of self is immediately followed
+    /// by the first address of `next` (i.e., they form a contiguous range).
+    fn is_contiguous_with(&self, next: &Self) -> bool;
 
     /// Number of addresses covered by this prefix, as f64 (for stats display).
     fn address_count_f64(&self) -> f64;
@@ -198,14 +205,28 @@ impl Aggregateable for NetblockV4 {
         Some((left, right))
     }
 
-    fn display_range(&self) -> String {
+    fn display_start(&self) -> String {
+        format!("{}", self.network)
+    }
+
+    fn display_end(&self) -> String {
         let start = u32::from(self.network);
         let end = if self.prefix_len == 0 {
             u32::MAX
         } else {
             start | ((1u32 << (32 - self.prefix_len)) - 1)
         };
-        format!("{}-{}", self.network, Ipv4Addr::from(end))
+        format!("{}", Ipv4Addr::from(end))
+    }
+
+    fn is_contiguous_with(&self, next: &Self) -> bool {
+        let start = u32::from(self.network);
+        let end = if self.prefix_len == 0 {
+            u32::MAX
+        } else {
+            start | ((1u32 << (32 - self.prefix_len)) - 1)
+        };
+        end < u32::MAX && end + 1 == u32::from(next.network)
     }
 
     #[inline]
@@ -372,14 +393,28 @@ impl Aggregateable for NetblockV6 {
         Some((left, right))
     }
 
-    fn display_range(&self) -> String {
+    fn display_start(&self) -> String {
+        format!("{}", self.network)
+    }
+
+    fn display_end(&self) -> String {
         let start = u128::from(self.network);
         let end = if self.prefix_len == 0 {
             u128::MAX
         } else {
             start | ((1u128 << (128 - self.prefix_len)) - 1)
         };
-        format!("{}-{}", self.network, Ipv6Addr::from(end))
+        format!("{}", Ipv6Addr::from(end))
+    }
+
+    fn is_contiguous_with(&self, next: &Self) -> bool {
+        let start = u128::from(self.network);
+        let end = if self.prefix_len == 0 {
+            u128::MAX
+        } else {
+            start | ((1u128 << (128 - self.prefix_len)) - 1)
+        };
+        end < u128::MAX && end + 1 == u128::from(next.network)
     }
 
     #[inline]
@@ -600,11 +635,27 @@ fn diff_sorted<T: Aggregateable>(old: &[T], new: &[T], out: &mut impl Write) {
 // ---------------------------------------------------------------------------
 
 /// Write aggregated netblocks to `out`, using range or CIDR format.
+/// In range mode, adjacent CIDRs are merged into contiguous ranges.
 fn write_netblocks<T: Aggregateable>(blocks: &[T], output_range: bool, out: &mut impl Write) {
     if output_range {
-        for nb in blocks {
-            let _ = writeln!(out, "{}", nb.display_range());
+        if blocks.is_empty() {
+            return;
         }
+        let mut range_start = blocks[0].display_start();
+        let mut range_end = blocks[0].display_end();
+        for pair in blocks.windows(2) {
+            if pair[0].is_contiguous_with(&pair[1]) {
+                // Extend the current range
+                range_end = pair[1].display_end();
+            } else {
+                // Emit the completed range and start a new one
+                let _ = writeln!(out, "{}-{}", range_start, range_end);
+                range_start = pair[1].display_start();
+                range_end = pair[1].display_end();
+            }
+        }
+        // Emit the final range
+        let _ = writeln!(out, "{}-{}", range_start, range_end);
     } else {
         for nb in blocks {
             let _ = writeln!(out, "{}", nb);
