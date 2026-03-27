@@ -1,7 +1,7 @@
 use clap::{Arg, Command};
 use std::error::Error;
 use std::fmt;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
@@ -15,31 +15,39 @@ impl Netblock {
     /// Zero out bits beyond `prefix_len`.
     #[inline]
     fn new(network: Ipv4Addr, prefix_len: u8) -> Self {
-        let shift = 32 - prefix_len;
-        let bits = u32::from(network);
-        let masked = (bits >> shift) << shift;
+        let masked = if prefix_len == 0 {
+            0
+        } else {
+            let shift = 32 - prefix_len;
+            (u32::from(network) >> shift) << shift
+        };
         Self { network: Ipv4Addr::from(masked), prefix_len }
     }
 
     /// Return true if `other` is a subnet of `self`.
     #[inline]
     fn contains(&self, other: &Netblock) -> bool {
+        if self.prefix_len > other.prefix_len {
+            return false;
+        }
+        if self.prefix_len == 0 {
+            return true; // /0 contains everything
+        }
         let shift = 32 - self.prefix_len;
         ((u32::from(self.network) ^ u32::from(other.network)) >> shift) == 0
-            && self.prefix_len <= other.prefix_len
     }
 
     /// Return true if both have the same prefix_len and differ only
     /// in the last bit of the prefix (siblings in the address space).
     #[inline]
     fn aggregateable_with(&self, other: &Netblock) -> bool {
-        if self.prefix_len != other.prefix_len {
+        if self.prefix_len != other.prefix_len || self.prefix_len == 0 {
             return false;
         }
         let shift = 32 - self.prefix_len;
         let s = u32::from(self.network) >> shift;
         let o = u32::from(other.network) >> shift;
-        (s >> 1) == (o >> 1)
+        (s ^ o) == 1 // Ensures they differ by EXACTLY the last bit of the prefix
     }
 
     /// Combine sibling netblocks into one with prefix_len - 1.
@@ -55,6 +63,9 @@ impl Netblock {
     /// Check if a network address is canonical (i.e., all bits beyond prefix are zero)
     #[inline]
     fn is_canonical(&self) -> bool {
+        if self.prefix_len == 0 {
+            return true;
+        }
         let shift = 32 - self.prefix_len;
         let bits = u32::from(self.network);
         let masked = (bits >> shift) << shift;
@@ -159,6 +170,11 @@ fn aggregate_netblocks(mut netblocks: Vec<Netblock>) -> Vec<Netblock> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let matches = Command::new("Netblock Aggregator")
         .version(env!("CARGO_PKG_VERSION"))
         .author("Sami Farin")
@@ -198,22 +214,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         // Try to convert to string, skip if invalid UTF-8
-        if let Ok(line) = String::from_utf8(buf.clone()) {
-            let line = line.trim();
+        if let Ok(line_str) = std::str::from_utf8(&buf) {
+            let line = line_str.trim();
             if !line.is_empty()
                 && let Ok(nb) = line.parse::<Netblock>()
-                && (!ignore_invalid || nb.is_canonical())
-            {
-                netblocks.push(Netblock::new(nb.network, nb.prefix_len));
-            }
+                    && (!ignore_invalid || nb.is_canonical()) {
+                        netblocks.push(Netblock::new(nb.network, nb.prefix_len));
+                    }
         }
         // If invalid UTF-8, just continue to the next line
     }
 
     // Aggregate and output
     let aggregated = aggregate_netblocks(netblocks);
+    let mut stdout = io::stdout().lock();
     for nb in aggregated {
-        println!("{}", nb);
+        let _ = writeln!(stdout, "{}", nb);
     }
 
     Ok(())

@@ -1,7 +1,7 @@
 use clap::{Arg, Command};
 use std::error::Error;
 use std::fmt;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 use std::net::Ipv6Addr;
 use std::str::FromStr;
 
@@ -16,30 +16,41 @@ impl Netblock {
     #[inline]
     fn new(network: Ipv6Addr, prefix_len: u8) -> Self {
         // Shift-based masking
-        let shift = 128 - prefix_len;
-        let bits = u128::from(network);
-        let masked = (bits >> shift) << shift;
+        let masked = if prefix_len == 0 {
+            0
+        } else {
+            let shift = 128 - prefix_len;
+            let bits = u128::from(network);
+            (bits >> shift) << shift
+        };
         Self { network: Ipv6Addr::from(masked), prefix_len }
     }
 
     /// True if `other` is fully contained in `self`.
     #[inline]
     fn contains(&self, other: &Netblock) -> bool {
+        if self.prefix_len > other.prefix_len {
+            return false;
+        }
+        if self.prefix_len == 0 {
+            return true; // /0 contains all of IPv6 space
+        }
         let shift = 128 - self.prefix_len;
         ((u128::from(self.network) ^ u128::from(other.network)) >> shift) == 0
-            && self.prefix_len <= other.prefix_len
     }
 
     /// True if both have the same prefix_len and differ only in the last bit of that prefix.
     #[inline]
     fn aggregateable_with(&self, other: &Netblock) -> bool {
-        if self.prefix_len != other.prefix_len {
+        // /0 cannot be aggregated further, and prefixes must match
+        if self.prefix_len != other.prefix_len || self.prefix_len == 0 {
             return false;
         }
         let shift = 128 - self.prefix_len;
         let s = u128::from(self.network) >> shift;
         let o = u128::from(other.network) >> shift;
-        (s >> 1) == (o >> 1)
+        // XORing them should result in exactly 1 if they are perfect siblings
+        (s ^ o) == 1
     }
 
     /// Merge two siblings into a single netblock with prefix_len - 1, if possible.
@@ -56,6 +67,9 @@ impl Netblock {
     /// Check if an IPv6 address is canonical for its prefix (all bits beyond prefix are zero)
     #[inline]
     fn is_canonical(&self) -> bool {
+        if self.prefix_len == 0 {
+            return true;
+        }
         let shift = 128 - self.prefix_len;
         let bits = u128::from(self.network);
         let masked = (bits >> shift) << shift;
@@ -159,6 +173,11 @@ fn aggregate_netblocks(mut netblocks: Vec<Netblock>) -> Vec<Netblock> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let matches = Command::new("IPv6 Netblock Aggregator")
         .version(env!("CARGO_PKG_VERSION"))
         .author("Sami Farin")
@@ -193,22 +212,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         // Try to convert to string, skip if invalid UTF-8
-        if let Ok(line) = String::from_utf8(buf.clone()) {
-            let line = line.trim();
+        if let Ok(line_str) = std::str::from_utf8(&buf) {
+            let line = line_str.trim();
             if !line.is_empty()
                 && let Ok(nb) = line.parse::<Netblock>()
-                && (!ignore_invalid || nb.is_canonical())
-            {
-                netblocks.push(Netblock::new(nb.network, nb.prefix_len));
-            }
+                    && (!ignore_invalid || nb.is_canonical()) {
+                        netblocks.push(Netblock::new(nb.network, nb.prefix_len));
+                    }
         }
         // If invalid UTF-8, just continue to the next line
     }
 
     // Aggregate and output
     let aggregated = aggregate_netblocks(netblocks);
+    let mut stdout = io::stdout().lock();
     for nb in aggregated {
-        println!("{}", nb);
+        let _ = writeln!(stdout, "{}", nb);
     }
 
     Ok(())
