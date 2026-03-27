@@ -42,3 +42,11 @@ _TMP6=$(mktemp tmp6.XXXXXX) || exit 1
 raggre6 --ignore-invalid test6invalid.txt > ${_TMP6}
 cmp test6invalid-ok.txt ${_TMP6} && rm -f ${_TMP6}
 
+if [ ! -f test6-0.txt ]; then
+  echo test6-0.txt missing
+  exit 1
+fi
+_TMP6=$(mktemp tmp6.XXXXXX) || exit 1
+raggre6 test6-0.txt > ${_TMP6}
+cmp test6-0-ok.txt ${_TMP6} && rm -f ${_TMP6}
+
