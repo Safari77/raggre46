@@ -1,13 +1,12 @@
-# raggre46
+# raggre
 
-`raggre4`
+`raggre`
 Aggregate IPv4 network addresses.
 
-`raggre6`
-Aggregate IPv6 network addresses.
+Since v0.5.0 raggre4 and raggre6 are combined into raggre.
 
 This is a rust program.  Dependencies: `clap`.  Random IP generators
-`ruran4` and `ruran6` require `rand`.
+`ruran4` and `ruran6` require `rand`.  `libc` is used to handle SIGPIPE.
 
 By default IP addresses are accepted if /nn network specified is invalid; for example
 1.4.5.6/16 is accepted and processed as 1.4.0.0/16; if you wish to ignore

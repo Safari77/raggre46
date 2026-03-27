@@ -10,12 +10,8 @@ libc = "0.2"
 rand = "0.10"
 
 [[bin]]
-name = "raggre4"
-path = "src/raggre4.rs"
-
-[[bin]]
-name = "raggre6"
-path = "src/raggre6.rs"
+name = "raggre"
+path = "src/raggre.rs"
 
 [[bin]]
 name = "ruran4"
