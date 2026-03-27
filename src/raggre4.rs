@@ -112,6 +112,48 @@ impl fmt::Display for Netblock {
     }
 }
 
+/// Convert an arbitrary IPv4 range [start, end] into the minimal set of CIDR prefixes.
+fn range_to_prefixes(start: u32, end: u32) -> Vec<Netblock> {
+    let mut prefixes = Vec::new();
+    let mut cur = start;
+
+    while cur <= end {
+        // Find how many trailing zero bits `cur` has — this limits alignment
+        let trailing = if cur == 0 { 32 } else { cur.trailing_zeros() };
+
+        // Find the largest block size (power of 2) that fits within [cur, end]
+        let max_size_bits = if end - cur == u32::MAX { 32 } else { (end - cur + 1).ilog2() };
+
+        let bits = std::cmp::min(trailing, max_size_bits);
+        let prefix_len = 32 - bits as u8;
+
+        prefixes.push(Netblock::new(Ipv4Addr::from(cur), prefix_len));
+
+        // Advance past this block
+        let block_size: u64 = 1u64 << bits;
+        let next = cur as u64 + block_size;
+        if next > u32::MAX as u64 {
+            break; // We've covered through 255.255.255.255
+        }
+        cur = next as u32;
+    }
+
+    prefixes
+}
+
+/// Parse an IPv4 range line of the form "A.B.C.D-E.F.G.H"
+fn parse_range(s: &str) -> Option<(u32, u32)> {
+    let (start_str, end_str) = s.split_once('-')?;
+    let start = Ipv4Addr::from_str(start_str.trim()).ok()?;
+    let end = Ipv4Addr::from_str(end_str.trim()).ok()?;
+    let start_u32 = u32::from(start);
+    let end_u32 = u32::from(end);
+    if start_u32 > end_u32 {
+        return None;
+    }
+    Some((start_u32, end_u32))
+}
+
 /// Merge netblocks until no more merges are possible.
 fn aggregate_netblocks(mut netblocks: Vec<Netblock>) -> Vec<Netblock> {
     if netblocks.len() <= 1 {
@@ -186,6 +228,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("input-range")
+                .long("input-range")
+                .help("Expect IPv4 ranges (A.B.C.D-E.F.G.H) instead of CIDR prefixes")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("input")
                 .help("Input file to process")
                 .required(false)
@@ -194,6 +242,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .get_matches();
 
     let ignore_invalid = matches.get_flag("ignore-invalid");
+    let input_range = matches.get_flag("input-range");
 
     // Create the reader based on input arg
     let mut input: Box<dyn BufRead> = match matches.get_one::<String>("input") {
@@ -216,11 +265,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Try to convert to string, skip if invalid UTF-8
         if let Ok(line_str) = std::str::from_utf8(&buf) {
             let line = line_str.trim();
-            if !line.is_empty()
-                && let Ok(nb) = line.parse::<Netblock>()
-                    && (!ignore_invalid || nb.is_canonical()) {
-                        netblocks.push(Netblock::new(nb.network, nb.prefix_len));
+            if !line.is_empty() {
+                if input_range {
+                    if let Some((start, end)) = parse_range(line) {
+                        netblocks.extend(range_to_prefixes(start, end));
                     }
+                } else if let Ok(nb) = line.parse::<Netblock>()
+                    && (!ignore_invalid || nb.is_canonical())
+                {
+                    netblocks.push(Netblock::new(nb.network, nb.prefix_len));
+                }
+            }
         }
         // If invalid UTF-8, just continue to the next line
     }
