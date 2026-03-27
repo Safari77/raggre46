@@ -18,6 +18,14 @@ _TMP4=$(mktemp tmp4.XXXXXX) || exit 1
 raggre4 --ignore-invalid test4invalid.txt > ${_TMP4}
 cmp test4invalid-ok.txt ${_TMP4} && rm -f ${_TMP4}
 
+if [ ! -f test4-0000.txt ]; then
+  echo test4-0000.txt missing
+  exit 1
+fi
+_TMP4=$(mktemp tmp4.XXXXXX) || exit 1
+raggre4 test4-0000.txt > ${_TMP4}
+cmp test4-0000-ok.txt ${_TMP4} && rm -f ${_TMP4}
+
 if [ ! -f test6.txt ]; then
   echo test6.txt missing
   exit 1
