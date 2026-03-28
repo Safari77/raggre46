@@ -4,6 +4,7 @@ use std::fmt;
 use std::io::{self, BufRead, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
+use unicode_segmentation::UnicodeSegmentation;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -57,6 +58,19 @@ struct Cli {
     /// Print aggregation statistics to stderr
     #[arg(long)]
     stats: bool,
+
+    /// Field delimiter: a single UTF-8 character or U+XXXX / UXXXX specification.
+    /// CESU-8 surrogate code points are rejected.
+    /// Must be used together with --fields.
+    #[arg(short = 'd', long, value_name = "CHAR")]
+    delimiter: Option<String>,
+
+    /// Comma-separated list of 1-based field numbers to extract after splitting
+    /// by --delimiter. Negative numbers count from the end of the line (-1 = last).
+    /// Each extracted field is tried as an IP address or netblock.
+    /// Must be used together with --delimiter.
+    #[arg(short = 'f', long, value_name = "FIELDS")]
+    fields: Option<String>,
 
     /// Input file(s) to process (two files required for --diff)
     #[arg(value_name = "FILE")]
@@ -670,7 +684,113 @@ fn total_addresses<T: Aggregateable>(blocks: &[T]) -> f64 {
 
 /// Format a large address count for human-readable display.
 fn format_count(count: f64) -> String {
+    let count = count + 0.0;
     if count < 1e15 { format!("{:.0}", count) } else { format!("{:.6e}", count) }
+}
+
+// ---------------------------------------------------------------------------
+// Delimiter/field extraction (cut-like UTF-8 aware processing)
+// ---------------------------------------------------------------------------
+
+/// Options for delimiter-based field extraction (cut-like mode).
+struct FieldOptions {
+    delimiter: char,
+    fields: Vec<i32>,
+}
+
+/// Parse a delimiter specification into a single Unicode scalar value.
+/// Accepts:
+///   - A single UTF-8 character (e.g. ":" or "→")
+///   - UXXXX or U+XXXX hex notation (e.g. "U003A" or "U+003A" for ':')
+/// Rejects CESU-8 surrogate code points (U+D800..U+DFFF).
+fn parse_delimiter(s: &str) -> Result<char, String> {
+    // Try U+XXXX or UXXXX format
+    let hex_str = if let Some(stripped) = s.strip_prefix("U+") {
+        Some(stripped)
+    } else if let Some(stripped) = s.strip_prefix('U') {
+        // Only treat as hex if all remaining chars are hex digits
+        if !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+            Some(stripped)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(hex) = hex_str {
+        if hex.is_empty() {
+            return Err("empty code point after 'U' prefix".to_string());
+        }
+        let code_point =
+            u32::from_str_radix(hex, 16).map_err(|_| format!("invalid Unicode escape: {}", s))?;
+        // Reject CESU-8 surrogates
+        if (0xD800..=0xDFFF).contains(&code_point) {
+            return Err(format!("CESU-8 surrogate code point U+{:04X} is not allowed", code_point));
+        }
+        char::from_u32(code_point)
+            .ok_or_else(|| format!("invalid Unicode code point: U+{:04X}", code_point))
+    } else {
+        // Must be exactly one Unicode scalar value (one grapheme cluster of one code point)
+        let graphemes: Vec<&str> = s.graphemes(true).collect();
+        if graphemes.len() != 1 {
+            return Err(format!(
+                "delimiter must be a single character, got {} grapheme cluster(s): {:?}",
+                graphemes.len(),
+                s
+            ));
+        }
+        let mut chars = graphemes[0].chars();
+        let ch = chars.next().ok_or_else(|| "empty delimiter".to_string())?;
+        if chars.next().is_some() {
+            return Err(format!(
+                "delimiter must be a single code point, \
+                 {:?} is a multi-code-point grapheme cluster",
+                graphemes[0]
+            ));
+        }
+        Ok(ch)
+    }
+}
+
+/// Parse a comma-separated list of 1-based field numbers.
+/// Positive numbers index from the start (1 = first).
+/// Negative numbers index from the end (-1 = last).
+/// Zero is not a valid field number.
+fn parse_field_spec(s: &str) -> Result<Vec<i32>, String> {
+    let mut fields = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let n: i32 = part.parse().map_err(|_| format!("invalid field number: {:?}", part))?;
+        if n == 0 {
+            return Err("field numbers are 1-based, 0 is not valid".to_string());
+        }
+        fields.push(n);
+    }
+    if fields.is_empty() {
+        return Err("no fields specified".to_string());
+    }
+    Ok(fields)
+}
+
+/// Extract a single field from a line split by delimiter.
+/// Positive field numbers are 1-based from the start.
+/// Negative field numbers count from the end (-1 = last field).
+fn extract_field<'a>(parts: &[&'a str], field: i32) -> Option<&'a str> {
+    let index = if field > 0 {
+        (field - 1) as usize
+    } else {
+        // Negative: count from end (-1 = last element)
+        let abs_field = (-field) as usize;
+        if abs_field > parts.len() {
+            return None;
+        }
+        parts.len() - abs_field
+    };
+    parts.get(index).copied()
 }
 
 // ---------------------------------------------------------------------------
@@ -683,6 +803,9 @@ struct ParseResult {
     v6: Vec<NetblockV6>,
     total_lines: usize,
     invalid_lines: usize,
+    /// Lines skipped because they contained invalid UTF-8
+    /// (only counted when --delimiter/--fields are active)
+    utf8_invalid_lines: usize,
 }
 
 /// Apply --max-length clamping to a vector of IPv4 netblocks.
@@ -761,9 +884,15 @@ fn read_netblocks(
     accept_v4: bool,
     accept_v6: bool,
     max_length: Option<u8>,
+    field_opts: Option<&FieldOptions>,
 ) -> Result<ParseResult, Box<dyn Error>> {
-    let mut result =
-        ParseResult { v4: Vec::new(), v6: Vec::new(), total_lines: 0, invalid_lines: 0 };
+    let mut result = ParseResult {
+        v4: Vec::new(),
+        v6: Vec::new(),
+        total_lines: 0,
+        invalid_lines: 0,
+        utf8_invalid_lines: 0,
+    };
     let mut buf = Vec::new();
 
     // Read lines as raw bytes to handle non-UTF8 content
@@ -774,26 +903,72 @@ fn read_netblocks(
             break; // End of input
         }
 
-        // Try to convert to string, skip if invalid UTF-8
-        if let Ok(line_str) = std::str::from_utf8(&buf) {
+        if let Some(fopts) = field_opts {
+            // Delimiter/fields mode: strict UTF-8 validation
+            let line_str = match std::str::from_utf8(&buf) {
+                Ok(s) => s,
+                Err(_) => {
+                    // Invalid UTF-8: skip and count as utf8 error
+                    result.utf8_invalid_lines += 1;
+                    continue;
+                }
+            };
             let line = line_str.trim();
-            if !line.is_empty() {
-                result.total_lines += 1;
-                let parsed = process_line(
-                    line,
-                    input_range,
-                    ignore_invalid,
-                    accept_v4,
-                    accept_v6,
-                    &mut result.v4,
-                    &mut result.v6,
-                );
-                if !parsed {
-                    result.invalid_lines += 1;
+            if line.is_empty() {
+                continue;
+            }
+            result.total_lines += 1;
+
+            let parts: Vec<&str> = line.split(fopts.delimiter).collect();
+            let mut any_parsed = false;
+
+            for &field_num in &fopts.fields {
+                if let Some(field_val) = extract_field(&parts, field_num) {
+                    let trimmed = field_val.trim();
+                    if !trimmed.is_empty() {
+                        let parsed = process_line(
+                            trimmed,
+                            input_range,
+                            ignore_invalid,
+                            accept_v4,
+                            accept_v6,
+                            &mut result.v4,
+                            &mut result.v6,
+                        );
+                        if parsed {
+                            any_parsed = true;
+                        }
+                    }
                 }
             }
+
+            if !any_parsed {
+                result.invalid_lines += 1;
+            }
+        } else {
+            // Original mode: no delimiter/fields, tolerates invalid UTF-8
+
+            // Try to convert to string, skip if invalid UTF-8
+            if let Ok(line_str) = std::str::from_utf8(&buf) {
+                let line = line_str.trim();
+                if !line.is_empty() {
+                    result.total_lines += 1;
+                    let parsed = process_line(
+                        line,
+                        input_range,
+                        ignore_invalid,
+                        accept_v4,
+                        accept_v6,
+                        &mut result.v4,
+                        &mut result.v6,
+                    );
+                    if !parsed {
+                        result.invalid_lines += 1;
+                    }
+                }
+            }
+            // If invalid UTF-8, just continue to the next line
         }
-        // If invalid UTF-8, just continue to the next line
     }
 
     // Apply max-length clamping if requested
@@ -813,9 +988,18 @@ fn read_netblocks_from_file(
     accept_v4: bool,
     accept_v6: bool,
     max_length: Option<u8>,
+    field_opts: Option<&FieldOptions>,
 ) -> Result<ParseResult, Box<dyn Error>> {
     let mut reader = io::BufReader::new(std::fs::File::open(path)?);
-    read_netblocks(&mut reader, input_range, ignore_invalid, accept_v4, accept_v6, max_length)
+    read_netblocks(
+        &mut reader,
+        input_range,
+        ignore_invalid,
+        accept_v4,
+        accept_v6,
+        max_length,
+        field_opts,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -844,6 +1028,34 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     }
 
+    // Validate --delimiter and --fields must be used together
+    if cli.delimiter.is_some() != cli.fields.is_some() {
+        eprintln!("error: --delimiter and --fields must be specified together");
+        std::process::exit(1);
+    }
+
+    // Parse delimiter and fields into FieldOptions
+    let field_opts = match (&cli.delimiter, &cli.fields) {
+        (Some(delim_str), Some(fields_str)) => {
+            let delimiter = match parse_delimiter(delim_str) {
+                Ok(ch) => ch,
+                Err(e) => {
+                    eprintln!("error: invalid delimiter: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let fields = match parse_field_spec(fields_str) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("error: invalid field specification: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            Some(FieldOptions { delimiter, fields })
+        }
+        _ => None,
+    };
+
     let accept_v4 = cli.accept_v4();
     let accept_v6 = cli.accept_v6();
 
@@ -858,6 +1070,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             accept_v4,
             accept_v6,
             cli.max_length,
+            field_opts.as_ref(),
         )?;
         let new = read_netblocks_from_file(
             &cli.input[1],
@@ -866,6 +1079,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             accept_v4,
             accept_v6,
             cli.max_length,
+            field_opts.as_ref(),
         )?;
 
         let old_v4 = aggregate_netblocks(old.v4);
@@ -887,18 +1101,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             let _ = writeln!(stderr, "--- {}", cli.input[0]);
             let _ = writeln!(
                 stderr,
-                "  Lines: {}  Invalid: {}  IPv4: {}  IPv6: {}",
+                "  Lines: {}  Invalid: {}  UTF-8 errors: {}  IPv4: {}  IPv6: {}",
                 old.total_lines,
                 old.invalid_lines,
+                old.utf8_invalid_lines,
                 old_v4.len(),
                 old_v6.len()
             );
             let _ = writeln!(stderr, "+++ {}", cli.input[1]);
             let _ = writeln!(
                 stderr,
-                "  Lines: {}  Invalid: {}  IPv4: {}  IPv6: {}",
+                "  Lines: {}  Invalid: {}  UTF-8 errors: {}  IPv4: {}  IPv6: {}",
                 new.total_lines,
                 new.invalid_lines,
+                new.utf8_invalid_lines,
                 new_v4.len(),
                 new_v6.len()
             );
@@ -925,6 +1141,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         accept_v4,
         accept_v6,
         cli.max_length,
+        field_opts.as_ref(),
     )?;
 
     let v4_before = parsed.v4.len();
@@ -942,6 +1159,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             accept_v4,
             accept_v6,
             cli.max_length,
+            field_opts.as_ref(),
         )?;
         let excl_v4 = aggregate_netblocks(excl.v4);
         let excl_v6 = aggregate_netblocks(excl.v6);
@@ -963,6 +1181,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             accept_v4,
             accept_v6,
             cli.max_length,
+            field_opts.as_ref(),
         )?;
         let isect_v4 = aggregate_netblocks(isect.v4);
         let isect_v6 = aggregate_netblocks(isect.v6);
@@ -988,8 +1207,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Print statistics to stderr if requested
     if cli.stats {
         let mut stderr = io::stderr().lock();
-        let _ =
-            writeln!(stderr, "Lines: {}  Invalid: {}", parsed.total_lines, parsed.invalid_lines);
+        let _ = writeln!(
+            stderr,
+            "Lines: {}  Invalid: {}  UTF-8 errors: {}",
+            parsed.total_lines, parsed.invalid_lines, parsed.utf8_invalid_lines
+        );
         if accept_v4 {
             let _ = writeln!(
                 stderr,

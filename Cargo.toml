@@ -8,6 +8,7 @@ publish = false
 clap = { version = "4.5", features = ["derive"] }
 libc = "0.2"
 rand = "0.10"
+unicode-segmentation = "1"
 
 [[bin]]
 name = "raggre"
