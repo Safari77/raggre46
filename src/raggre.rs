@@ -72,6 +72,18 @@ struct Cli {
     #[arg(short = 'f', long, value_name = "FIELDS")]
     fields: Option<String>,
 
+    /// Read input as CSV and extract the field at this 1-based column number.
+    /// Assumes no header row. Cannot be combined with --delimiter/--fields
+    /// or --csv-field-name.
+    #[arg(long, value_name = "N")]
+    csv_field_number: Option<usize>,
+
+    /// Read input as CSV and extract the field under this column header name.
+    /// The header name may contain whitespace. Cannot be combined with
+    /// --delimiter/--fields or --csv-field-number.
+    #[arg(long, value_name = "NAME")]
+    csv_field_name: Option<String>,
+
     /// Input file(s) to process (two files required for --diff)
     #[arg(value_name = "FILE")]
     input: Vec<String>,
@@ -508,6 +520,29 @@ fn parse_range_v6(s: &str) -> Option<(u128, u128)> {
 // Generic aggregation — single implementation for both address families
 // ---------------------------------------------------------------------------
 
+/// Sort and remove contained (duplicate/subset) netblocks without merging
+/// siblings.  Used by --diff so that individual prefixes are compared as-is
+/// rather than being collapsed into larger blocks first.
+fn normalize_netblocks<T: Aggregateable>(mut netblocks: Vec<T>) -> Vec<T> {
+    if netblocks.len() <= 1 {
+        return netblocks;
+    }
+
+    netblocks.sort_unstable();
+
+    let mut deduped = Vec::with_capacity(netblocks.len());
+    let mut prev = netblocks[0];
+
+    for &current in &netblocks[1..] {
+        if !prev.contains(&current) {
+            deduped.push(prev);
+            prev = current;
+        }
+    }
+    deduped.push(prev);
+    deduped
+}
+
 /// Merge netblocks until no more merges are possible.
 fn aggregate_netblocks<T: Aggregateable>(mut netblocks: Vec<T>) -> Vec<T> {
     if netblocks.len() <= 1 {
@@ -794,6 +829,165 @@ fn extract_field<'a>(parts: &[&'a str], field: i32) -> Option<&'a str> {
 }
 
 // ---------------------------------------------------------------------------
+// CSV field extraction
+// ---------------------------------------------------------------------------
+
+/// Specifies which column to extract from CSV input.
+enum CsvOptions {
+    /// Column by 0-based index (user provides 1-based, converted before storing).
+    ByNumber(usize),
+    /// Column by header name (first row is the header).
+    ByName(String),
+}
+
+/// Read netblocks from a CSV source using the `csv` crate.
+/// Extracts the specified column from each row and feeds it through `process_line`.
+fn read_netblocks_csv(
+    reader: Box<dyn io::Read>,
+    csv_opts: &CsvOptions,
+    input_range: bool,
+    ignore_invalid: bool,
+    accept_v4: bool,
+    accept_v6: bool,
+    max_length: Option<u8>,
+) -> Result<ParseResult, Box<dyn Error>> {
+    let mut result = ParseResult {
+        v4: Vec::new(),
+        v6: Vec::new(),
+        total_lines: 0,
+        invalid_lines: 0,
+        utf8_invalid_lines: 0,
+    };
+
+    let col_index: usize;
+
+    match csv_opts {
+        CsvOptions::ByNumber(idx) => {
+            col_index = *idx;
+            let mut rdr = csv::ReaderBuilder::new().has_headers(false).from_reader(reader);
+
+            for row_result in rdr.records() {
+                let record = match row_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // csv::Error can be a UTF-8 error or a parse error
+                        if matches!(e.kind(), csv::ErrorKind::Utf8 { .. }) {
+                            result.utf8_invalid_lines += 1;
+                        } else {
+                            result.invalid_lines += 1;
+                        }
+                        continue;
+                    }
+                };
+                result.total_lines += 1;
+
+                if let Some(field_val) = record.get(col_index) {
+                    let trimmed = field_val.trim();
+                    if !trimmed.is_empty() {
+                        let parsed = process_line(
+                            trimmed,
+                            input_range,
+                            ignore_invalid,
+                            accept_v4,
+                            accept_v6,
+                            &mut result.v4,
+                            &mut result.v6,
+                        );
+                        if !parsed {
+                            result.invalid_lines += 1;
+                        }
+                    } else {
+                        result.invalid_lines += 1;
+                    }
+                } else {
+                    result.invalid_lines += 1;
+                }
+            }
+        }
+        CsvOptions::ByName(name) => {
+            let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_reader(reader);
+
+            // Find the column index from the header row
+            let headers = rdr.headers()?.clone();
+            col_index = headers.iter().position(|h| h.trim() == name.trim()).ok_or_else(|| {
+                format!(
+                    "CSV header {:?} not found (available: {})",
+                    name,
+                    headers.iter().map(|h| format!("{:?}", h)).collect::<Vec<_>>().join(", ")
+                )
+            })?;
+
+            for row_result in rdr.records() {
+                let record = match row_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if matches!(e.kind(), csv::ErrorKind::Utf8 { .. }) {
+                            result.utf8_invalid_lines += 1;
+                        } else {
+                            result.invalid_lines += 1;
+                        }
+                        continue;
+                    }
+                };
+                result.total_lines += 1;
+
+                if let Some(field_val) = record.get(col_index) {
+                    let trimmed = field_val.trim();
+                    if !trimmed.is_empty() {
+                        let parsed = process_line(
+                            trimmed,
+                            input_range,
+                            ignore_invalid,
+                            accept_v4,
+                            accept_v6,
+                            &mut result.v4,
+                            &mut result.v6,
+                        );
+                        if !parsed {
+                            result.invalid_lines += 1;
+                        }
+                    } else {
+                        result.invalid_lines += 1;
+                    }
+                } else {
+                    result.invalid_lines += 1;
+                }
+            }
+        }
+    }
+
+    // Apply max-length clamping if requested
+    if let Some(max_len) = max_length {
+        apply_max_length_v4(&mut result.v4, max_len);
+        apply_max_length_v6(&mut result.v6, max_len);
+    }
+
+    Ok(result)
+}
+
+/// Open a file and read netblocks from it in CSV mode.
+fn read_netblocks_csv_from_file(
+    path: &str,
+    csv_opts: &CsvOptions,
+    input_range: bool,
+    ignore_invalid: bool,
+    accept_v4: bool,
+    accept_v6: bool,
+    max_length: Option<u8>,
+) -> Result<ParseResult, Box<dyn Error>> {
+    let file = std::fs::File::open(path)?;
+    read_netblocks_csv(
+        Box::new(file),
+        csv_opts,
+        input_range,
+        ignore_invalid,
+        accept_v4,
+        accept_v6,
+        max_length,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Input processing
 // ---------------------------------------------------------------------------
 
@@ -1034,6 +1228,30 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     }
 
+    // Validate --csv-field-number and --csv-field-name are mutually exclusive
+    if cli.csv_field_number.is_some() && cli.csv_field_name.is_some() {
+        eprintln!("error: --csv-field-number and --csv-field-name cannot be used together");
+        std::process::exit(1);
+    }
+
+    // Validate CSV options are not combined with delimiter/fields
+    let has_csv = cli.csv_field_number.is_some() || cli.csv_field_name.is_some();
+    let has_delim = cli.delimiter.is_some();
+    if has_csv && has_delim {
+        eprintln!(
+            "error: --csv-field-number/--csv-field-name cannot be combined with --delimiter/--fields"
+        );
+        std::process::exit(1);
+    }
+
+    // Validate --csv-field-number is >= 1 (1-based)
+    if let Some(n) = cli.csv_field_number {
+        if n < 1 {
+            eprintln!("error: --csv-field-number is 1-based, 0 is not valid");
+            std::process::exit(1);
+        }
+    }
+
     // Parse delimiter and fields into FieldOptions
     let field_opts = match (&cli.delimiter, &cli.fields) {
         (Some(delim_str), Some(fields_str)) => {
@@ -1056,6 +1274,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         _ => None,
     };
 
+    // Parse CSV options
+    let csv_opts = if let Some(n) = cli.csv_field_number {
+        Some(CsvOptions::ByNumber(n - 1)) // Convert 1-based to 0-based
+    } else if let Some(ref name) = cli.csv_field_name {
+        Some(CsvOptions::ByName(name.clone()))
+    } else {
+        None
+    };
+
     let accept_v4 = cli.accept_v4();
     let accept_v6 = cli.accept_v6();
 
@@ -1063,29 +1290,53 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Diff mode — compare two files
     // -----------------------------------------------------------------------
     if cli.diff {
-        let old = read_netblocks_from_file(
-            &cli.input[0],
-            cli.input_range,
-            cli.ignore_invalid,
-            accept_v4,
-            accept_v6,
-            cli.max_length,
-            field_opts.as_ref(),
-        )?;
-        let new = read_netblocks_from_file(
-            &cli.input[1],
-            cli.input_range,
-            cli.ignore_invalid,
-            accept_v4,
-            accept_v6,
-            cli.max_length,
-            field_opts.as_ref(),
-        )?;
+        let old = if let Some(ref copts) = csv_opts {
+            read_netblocks_csv_from_file(
+                &cli.input[0],
+                copts,
+                cli.input_range,
+                cli.ignore_invalid,
+                accept_v4,
+                accept_v6,
+                cli.max_length,
+            )?
+        } else {
+            read_netblocks_from_file(
+                &cli.input[0],
+                cli.input_range,
+                cli.ignore_invalid,
+                accept_v4,
+                accept_v6,
+                cli.max_length,
+                field_opts.as_ref(),
+            )?
+        };
+        let new = if let Some(ref copts) = csv_opts {
+            read_netblocks_csv_from_file(
+                &cli.input[1],
+                copts,
+                cli.input_range,
+                cli.ignore_invalid,
+                accept_v4,
+                accept_v6,
+                cli.max_length,
+            )?
+        } else {
+            read_netblocks_from_file(
+                &cli.input[1],
+                cli.input_range,
+                cli.ignore_invalid,
+                accept_v4,
+                accept_v6,
+                cli.max_length,
+                field_opts.as_ref(),
+            )?
+        };
 
-        let old_v4 = aggregate_netblocks(old.v4);
-        let new_v4 = aggregate_netblocks(new.v4);
-        let old_v6 = aggregate_netblocks(old.v6);
-        let new_v6 = aggregate_netblocks(new.v6);
+        let old_v4 = normalize_netblocks(old.v4);
+        let new_v4 = normalize_netblocks(new.v4);
+        let old_v6 = normalize_netblocks(old.v6);
+        let new_v6 = normalize_netblocks(new.v6);
 
         let mut stdout = io::stdout().lock();
 
@@ -1128,21 +1379,37 @@ fn main() -> Result<(), Box<dyn Error>> {
     // -----------------------------------------------------------------------
 
     // Create the reader based on input arg
-    let mut input: Box<dyn BufRead> = if let Some(file) = cli.input.first() {
-        Box::new(io::BufReader::new(std::fs::File::open(file)?))
+    let parsed = if let Some(ref copts) = csv_opts {
+        let input: Box<dyn io::Read> = if let Some(file) = cli.input.first() {
+            Box::new(std::fs::File::open(file)?)
+        } else {
+            Box::new(io::stdin())
+        };
+        read_netblocks_csv(
+            input,
+            copts,
+            cli.input_range,
+            cli.ignore_invalid,
+            accept_v4,
+            accept_v6,
+            cli.max_length,
+        )?
     } else {
-        Box::new(io::BufReader::new(io::stdin()))
+        let mut input: Box<dyn BufRead> = if let Some(file) = cli.input.first() {
+            Box::new(io::BufReader::new(std::fs::File::open(file)?))
+        } else {
+            Box::new(io::BufReader::new(io::stdin()))
+        };
+        read_netblocks(
+            &mut input,
+            cli.input_range,
+            cli.ignore_invalid,
+            accept_v4,
+            accept_v6,
+            cli.max_length,
+            field_opts.as_ref(),
+        )?
     };
-
-    let parsed = read_netblocks(
-        &mut input,
-        cli.input_range,
-        cli.ignore_invalid,
-        accept_v4,
-        accept_v6,
-        cli.max_length,
-        field_opts.as_ref(),
-    )?;
 
     let v4_before = parsed.v4.len();
     let v6_before = parsed.v6.len();
@@ -1152,15 +1419,27 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Apply --exclude if specified
     if let Some(ref excl_path) = cli.exclude {
-        let excl = read_netblocks_from_file(
-            excl_path,
-            cli.input_range,
-            cli.ignore_invalid,
-            accept_v4,
-            accept_v6,
-            cli.max_length,
-            field_opts.as_ref(),
-        )?;
+        let excl = if let Some(ref copts) = csv_opts {
+            read_netblocks_csv_from_file(
+                excl_path,
+                copts,
+                cli.input_range,
+                cli.ignore_invalid,
+                accept_v4,
+                accept_v6,
+                cli.max_length,
+            )?
+        } else {
+            read_netblocks_from_file(
+                excl_path,
+                cli.input_range,
+                cli.ignore_invalid,
+                accept_v4,
+                accept_v6,
+                cli.max_length,
+                field_opts.as_ref(),
+            )?
+        };
         let excl_v4 = aggregate_netblocks(excl.v4);
         let excl_v6 = aggregate_netblocks(excl.v6);
 
@@ -1174,15 +1453,27 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Apply --intersect if specified
     if let Some(ref isect_path) = cli.intersect {
-        let isect = read_netblocks_from_file(
-            isect_path,
-            cli.input_range,
-            cli.ignore_invalid,
-            accept_v4,
-            accept_v6,
-            cli.max_length,
-            field_opts.as_ref(),
-        )?;
+        let isect = if let Some(ref copts) = csv_opts {
+            read_netblocks_csv_from_file(
+                isect_path,
+                copts,
+                cli.input_range,
+                cli.ignore_invalid,
+                accept_v4,
+                accept_v6,
+                cli.max_length,
+            )?
+        } else {
+            read_netblocks_from_file(
+                isect_path,
+                cli.input_range,
+                cli.ignore_invalid,
+                accept_v4,
+                accept_v6,
+                cli.max_length,
+                field_opts.as_ref(),
+            )?
+        };
         let isect_v4 = aggregate_netblocks(isect.v4);
         let isect_v6 = aggregate_netblocks(isect.v6);
 
