@@ -737,20 +737,15 @@ struct FieldOptions {
 /// Accepts:
 ///   - A single UTF-8 character (e.g. ":" or "→")
 ///   - UXXXX or U+XXXX hex notation (e.g. "U003A" or "U+003A" for ':')
-/// Rejects CESU-8 surrogate code points (U+D800..U+DFFF).
+///     Rejects CESU-8 surrogate code points (U+D800..U+DFFF).
 fn parse_delimiter(s: &str) -> Result<char, String> {
     // Try U+XXXX or UXXXX format
     let hex_str = if let Some(stripped) = s.strip_prefix("U+") {
         Some(stripped)
-    } else if let Some(stripped) = s.strip_prefix('U') {
-        // Only treat as hex if all remaining chars are hex digits
-        if !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
-            Some(stripped)
-        } else {
-            None
-        }
     } else {
-        None
+        s.strip_prefix('U').filter(|&stripped| {
+            !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_hexdigit())
+        })
     };
 
     if let Some(hex) = hex_str {
@@ -1035,36 +1030,30 @@ fn process_line(
 ) -> bool {
     if input_range {
         // Try IPv4 range first (dotted-decimal never contains ':')
-        if accept_v4 {
-            if let Some((start, end)) = parse_range_v4(line) {
-                v4.extend(range_to_prefixes_v4(start, end));
-                return true;
-            }
+        if accept_v4 && let Some((start, end)) = parse_range_v4(line) {
+            v4.extend(range_to_prefixes_v4(start, end));
+            return true;
         }
-        if accept_v6 {
-            if let Some((start, end)) = parse_range_v6(line) {
-                v6.extend(range_to_prefixes_v6(start, end));
-                return true;
-            }
+        if accept_v6 && let Some((start, end)) = parse_range_v6(line) {
+            v6.extend(range_to_prefixes_v6(start, end));
+            return true;
         }
         false
     } else {
         // Try IPv4 CIDR / bare address first
-        if accept_v4 {
-            if let Ok(nb) = line.parse::<NetblockV4>() {
-                if !ignore_invalid || nb.is_canonical() {
-                    v4.push(NetblockV4::new(nb.network, nb.prefix_len));
-                    return true;
-                }
-            }
+        if accept_v4
+            && let Ok(nb) = line.parse::<NetblockV4>()
+            && (!ignore_invalid || nb.is_canonical())
+        {
+            v4.push(NetblockV4::new(nb.network, nb.prefix_len));
+            return true;
         }
-        if accept_v6 {
-            if let Ok(nb) = line.parse::<NetblockV6>() {
-                if !ignore_invalid || nb.is_canonical() {
-                    v6.push(NetblockV6::new(nb.network, nb.prefix_len));
-                    return true;
-                }
-            }
+        if accept_v6
+            && let Ok(nb) = line.parse::<NetblockV6>()
+            && (!ignore_invalid || nb.is_canonical())
+        {
+            v6.push(NetblockV6::new(nb.network, nb.prefix_len));
+            return true;
         }
         false
     }
@@ -1245,11 +1234,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Validate --csv-field-number is >= 1 (1-based)
-    if let Some(n) = cli.csv_field_number {
-        if n < 1 {
-            eprintln!("error: --csv-field-number is 1-based, 0 is not valid");
-            std::process::exit(1);
-        }
+    if let Some(n) = cli.csv_field_number
+        && n < 1
+    {
+        eprintln!("error: --csv-field-number is 1-based, 0 is not valid");
+        std::process::exit(1);
     }
 
     // Parse delimiter and fields into FieldOptions
@@ -1277,10 +1266,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Parse CSV options
     let csv_opts = if let Some(n) = cli.csv_field_number {
         Some(CsvOptions::ByNumber(n - 1)) // Convert 1-based to 0-based
-    } else if let Some(ref name) = cli.csv_field_name {
-        Some(CsvOptions::ByName(name.clone()))
     } else {
-        None
+        cli.csv_field_name.as_ref().map(|name| CsvOptions::ByName(name.clone()))
     };
 
     let accept_v4 = cli.accept_v4();
