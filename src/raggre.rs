@@ -34,6 +34,21 @@ struct Cli {
     #[arg(long)]
     output_range: bool,
 
+    /// Output as network/netmask (e.g. 10.0.0.0/255.255.255.0). For IPv6 the
+    /// mask is the full address form (e.g. 2001:db8::/ffff:ffff::).
+    #[arg(long)]
+    output_netmask: bool,
+
+    /// Output as Cisco-style "network wildcard" (e.g. 10.0.0.0 0.0.0.255).
+    /// IPv6 has no wildcard-mask convention, so IPv6 blocks fall back to CIDR.
+    #[arg(long)]
+    output_wildcard: bool,
+
+    /// Emit results as JSON: IPv4 in "results4", IPv6 in "results6". With
+    /// --stats, statistics are placed in a separate "stats" object.
+    #[arg(long)]
+    json: bool,
+
     /// Skip addresses that don't match their prefix
     /// (e.g. 1.2.3.4/24 must have last 8 bits zero)
     #[arg(long)]
@@ -123,12 +138,21 @@ trait Aggregateable: Ord + Copy + fmt::Display {
     /// Format just the last address of this prefix.
     fn display_end(&self) -> String;
 
+    /// Format as network/netmask (family-specific mask representation).
+    fn display_netmask(&self) -> String;
+
+    /// Format as a Cisco-style "network wildcard" pair (IPv4); IPv6
+    /// implementations fall back to CIDR since wildcard masks are IPv4-only.
+    fn display_wildcard(&self) -> String;
+
     /// Return true if the last address of self is immediately followed
     /// by the first address of `next` (i.e., they form a contiguous range).
     fn is_contiguous_with(&self, next: &Self) -> bool;
 
-    /// Number of addresses covered by this prefix, as f64 (for stats display).
-    fn address_count_f64(&self) -> f64;
+    /// Number of addresses covered by this prefix, as an exact u128.
+    /// Returns None only for the whole IPv6 space (/0), whose count is 2^128
+    /// and therefore one larger than u128::MAX.
+    fn address_count(&self) -> Option<u128>;
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +269,18 @@ impl Aggregateable for NetblockV4 {
         format!("{}", Ipv4Addr::from(end))
     }
 
+    fn display_netmask(&self) -> String {
+        // prefix_len == 0 must be special-cased: `u32::MAX << 32` would overflow.
+        let mask = if self.prefix_len == 0 { 0 } else { u32::MAX << (32 - self.prefix_len) };
+        format!("{}/{}", self.network, Ipv4Addr::from(mask))
+    }
+
+    fn display_wildcard(&self) -> String {
+        let mask = if self.prefix_len == 0 { 0 } else { u32::MAX << (32 - self.prefix_len) };
+        let wildcard = !mask;
+        format!("{} {}", self.network, Ipv4Addr::from(wildcard))
+    }
+
     fn is_contiguous_with(&self, next: &Self) -> bool {
         let start = u32::from(self.network);
         let end = if self.prefix_len == 0 {
@@ -256,8 +292,9 @@ impl Aggregateable for NetblockV4 {
     }
 
     #[inline]
-    fn address_count_f64(&self) -> f64 {
-        2.0f64.powi((32 - self.prefix_len) as i32)
+    fn address_count(&self) -> Option<u128> {
+        // IPv4 maxes out at 2^32 addresses, which always fits in u128.
+        Some(1u128 << (32 - self.prefix_len))
     }
 }
 
@@ -433,6 +470,17 @@ impl Aggregateable for NetblockV6 {
         format!("{}", Ipv6Addr::from(end))
     }
 
+    fn display_netmask(&self) -> String {
+        // prefix_len == 0 must be special-cased: `u128::MAX << 128` would overflow.
+        let mask = if self.prefix_len == 0 { 0 } else { u128::MAX << (128 - self.prefix_len) };
+        format!("{}/{}", self.network, Ipv6Addr::from(mask))
+    }
+
+    fn display_wildcard(&self) -> String {
+        // IPv6 has no Cisco-style wildcard-mask convention; fall back to CIDR.
+        format!("{}/{}", self.network, self.prefix_len)
+    }
+
     fn is_contiguous_with(&self, next: &Self) -> bool {
         let start = u128::from(self.network);
         let end = if self.prefix_len == 0 {
@@ -444,8 +492,10 @@ impl Aggregateable for NetblockV6 {
     }
 
     #[inline]
-    fn address_count_f64(&self) -> f64 {
-        2.0f64.powi((128 - self.prefix_len) as i32)
+    fn address_count(&self) -> Option<u128> {
+        // A /0 covers 2^128 addresses, which is one more than u128::MAX,
+        // so it cannot be represented; the caller treats None as 2^128.
+        if self.prefix_len == 0 { None } else { Some(1u128 << (128 - self.prefix_len)) }
     }
 }
 
@@ -491,6 +541,12 @@ fn range_to_prefixes_v6(start: u128, end: u128) -> Vec<NetblockV6> {
         let prefix_len = 128 - bits as u8;
 
         prefixes.push(NetblockV6::new(Ipv6Addr::from(cur), prefix_len));
+
+        // A /0 covers the entire space in one block; computing block_size below
+        // as `1u128 << 128` would overflow the shift, so stop once it is emitted.
+        if bits >= 128 {
+            break;
+        }
 
         // Advance past this block
         let block_size: u128 = 1u128 << bits;
@@ -654,7 +710,8 @@ fn intersect_sets<T: Aggregateable>(a: &[T], b: &[T]) -> Vec<T> {
 
 /// Compare two sorted, aggregated lists and write differences to `out`.
 /// Lines only in `old` are prefixed with "- ", lines only in `new` with "+ ".
-fn diff_sorted<T: Aggregateable>(old: &[T], new: &[T], out: &mut impl Write) {
+/// Each emitted netblock is rendered using `fmt`.
+fn diff_sorted<T: Aggregateable>(old: &[T], new: &[T], fmt: OutputFormat, out: &mut impl Write) {
     let mut i = 0;
     let mut j = 0;
     while i < old.len() && j < new.len() {
@@ -662,65 +719,214 @@ fn diff_sorted<T: Aggregateable>(old: &[T], new: &[T], out: &mut impl Write) {
             i += 1;
             j += 1;
         } else if old[i] < new[j] {
-            let _ = writeln!(out, "- {}", old[i]);
+            let _ = writeln!(out, "- {}", format_block(&old[i], fmt));
             i += 1;
         } else {
-            let _ = writeln!(out, "+ {}", new[j]);
+            let _ = writeln!(out, "+ {}", format_block(&new[j], fmt));
             j += 1;
         }
     }
     while i < old.len() {
-        let _ = writeln!(out, "- {}", old[i]);
+        let _ = writeln!(out, "- {}", format_block(&old[i], fmt));
         i += 1;
     }
     while j < new.len() {
-        let _ = writeln!(out, "+ {}", new[j]);
+        let _ = writeln!(out, "+ {}", format_block(&new[j], fmt));
         j += 1;
     }
+}
+
+/// Compare two sorted, aggregated lists and collect the differences.
+/// Returns (removed, added): netblocks only in `old`, and only in `new`.
+fn diff_collect<T: Aggregateable>(old: &[T], new: &[T]) -> (Vec<T>, Vec<T>) {
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    let mut i = 0;
+    let mut j = 0;
+    while i < old.len() && j < new.len() {
+        if old[i] == new[j] {
+            i += 1;
+            j += 1;
+        } else if old[i] < new[j] {
+            removed.push(old[i]);
+            i += 1;
+        } else {
+            added.push(new[j]);
+            j += 1;
+        }
+    }
+    while i < old.len() {
+        removed.push(old[i]);
+        i += 1;
+    }
+    while j < new.len() {
+        added.push(new[j]);
+        j += 1;
+    }
+    (removed, added)
 }
 
 // ---------------------------------------------------------------------------
 // Output helpers
 // ---------------------------------------------------------------------------
 
-/// Write aggregated netblocks to `out`, using range or CIDR format.
-/// In range mode, adjacent CIDRs are merged into contiguous ranges.
-fn write_netblocks<T: Aggregateable>(blocks: &[T], output_range: bool, out: &mut impl Write) {
-    if output_range {
-        if blocks.is_empty() {
-            return;
-        }
-        let mut range_start = blocks[0].display_start();
-        let mut range_end = blocks[0].display_end();
-        for pair in blocks.windows(2) {
-            if pair[0].is_contiguous_with(&pair[1]) {
-                // Extend the current range
-                range_end = pair[1].display_end();
-            } else {
-                // Emit the completed range and start a new one
-                let _ = writeln!(out, "{}-{}", range_start, range_end);
-                range_start = pair[1].display_start();
-                range_end = pair[1].display_end();
-            }
-        }
-        // Emit the final range
-        let _ = writeln!(out, "{}-{}", range_start, range_end);
-    } else {
-        for nb in blocks {
-            let _ = writeln!(out, "{}", nb);
-        }
+/// Selected output rendering for netblocks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputFormat {
+    /// network/prefix (e.g. 10.0.0.0/8)
+    Cidr,
+    /// start-end ranges, merging contiguous blocks
+    Range,
+    /// network/netmask (e.g. 10.0.0.0/255.0.0.0)
+    Netmask,
+    /// Cisco "network wildcard" (e.g. 10.0.0.0 0.255.255.255)
+    Wildcard,
+}
+
+/// Render a single netblock in the given format.
+/// Range mode renders this block's own span; contiguous merging across blocks
+/// is only performed by `format_blocks`.
+fn format_block<T: Aggregateable>(nb: &T, fmt: OutputFormat) -> String {
+    match fmt {
+        OutputFormat::Cidr => nb.to_string(),
+        OutputFormat::Netmask => nb.display_netmask(),
+        OutputFormat::Wildcard => nb.display_wildcard(),
+        OutputFormat::Range => format!("{}-{}", nb.display_start(), nb.display_end()),
     }
 }
 
-/// Sum address counts across all netblocks (as f64 for display).
-fn total_addresses<T: Aggregateable>(blocks: &[T]) -> f64 {
-    blocks.iter().map(|b| b.address_count_f64()).sum()
+/// Render aggregated netblocks into one output string per line.
+/// In range mode, adjacent CIDRs are merged into contiguous ranges.
+fn format_blocks<T: Aggregateable>(blocks: &[T], fmt: OutputFormat) -> Vec<String> {
+    if fmt != OutputFormat::Range {
+        return blocks.iter().map(|nb| format_block(nb, fmt)).collect();
+    }
+
+    let mut out = Vec::new();
+    if blocks.is_empty() {
+        return out;
+    }
+    let mut range_start = blocks[0].display_start();
+    let mut range_end = blocks[0].display_end();
+    for pair in blocks.windows(2) {
+        if pair[0].is_contiguous_with(&pair[1]) {
+            // Extend the current range
+            range_end = pair[1].display_end();
+        } else {
+            // Emit the completed range and start a new one
+            out.push(format!("{}-{}", range_start, range_end));
+            range_start = pair[1].display_start();
+            range_end = pair[1].display_end();
+        }
+    }
+    // Emit the final range
+    out.push(format!("{}-{}", range_start, range_end));
+    out
 }
 
-/// Format a large address count for human-readable display.
-fn format_count(count: f64) -> String {
-    let count = count + 0.0;
-    if count < 1e15 { format!("{:.0}", count) } else { format!("{:.6e}", count) }
+/// Write aggregated netblocks to `out` in the selected format.
+fn write_netblocks<T: Aggregateable>(blocks: &[T], fmt: OutputFormat, out: &mut impl Write) {
+    for line in format_blocks(blocks, fmt) {
+        let _ = writeln!(out, "{}", line);
+    }
+}
+
+/// Sum address counts across all netblocks, returning an exact decimal string.
+/// Counts are accumulated in u128; the only total that does not fit is the
+/// whole IPv6 space (2^128 = u128::MAX + 1), which is reported as such.
+fn total_addresses_string<T: Aggregateable>(blocks: &[T]) -> String {
+    // 2^128 in decimal (u128::MAX + 1); the single value that overflows u128.
+    const FULL_IPV6_SPACE: &str = "340282366920938463463374607431768211456";
+
+    let mut sum: u128 = 0;
+    for b in blocks {
+        match b.address_count() {
+            // None marks the IPv6 /0 block, whose count is exactly 2^128.
+            None => return FULL_IPV6_SPACE.to_string(),
+            Some(c) => match sum.checked_add(c) {
+                Some(s) => sum = s,
+                // Non-overlapping blocks total at most 2^128; overflowing u128
+                // therefore means the sum is exactly 2^128.
+                None => return FULL_IPV6_SPACE.to_string(),
+            },
+        }
+    }
+    sum.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// JSON output (dependency-free; results are arrays of plain strings)
+// ---------------------------------------------------------------------------
+
+/// Escape a string for safe inclusion inside a JSON string literal.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `"key": [ ... ]` member with each element on its own line, indented.
+fn json_array_member(key: &str, items: &[String], indent: usize) -> String {
+    let pad = "  ".repeat(indent);
+    if items.is_empty() {
+        return format!("{}\"{}\": []", pad, json_escape(key));
+    }
+    let ipad = "  ".repeat(indent + 1);
+    let body = items
+        .iter()
+        .map(|it| format!("{}\"{}\"", ipad, json_escape(it)))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!("{}\"{}\": [\n{}\n{}]", pad, json_escape(key), body, pad)
+}
+
+/// `"key": <number>` member.
+fn json_num_member(key: &str, val: u64, indent: usize) -> String {
+    format!("{}\"{}\": {}", "  ".repeat(indent), json_escape(key), val)
+}
+
+/// `"key": "<string>"` member.
+fn json_str_member(key: &str, val: &str, indent: usize) -> String {
+    format!("{}\"{}\": \"{}\"", "  ".repeat(indent), json_escape(key), json_escape(val))
+}
+
+/// `"key": { ... }` member from already-rendered inner members.
+fn json_object_member(key: &str, inner: &[String], indent: usize) -> String {
+    let pad = "  ".repeat(indent);
+    if inner.is_empty() {
+        return format!("{}\"{}\": {{}}", pad, json_escape(key));
+    }
+    format!("{}\"{}\": {{\n{}\n{}}}", pad, json_escape(key), inner.join(",\n"), pad)
+}
+
+/// Wrap top-level members into a complete JSON object document.
+fn json_document(members: &[String]) -> String {
+    if members.is_empty() {
+        return "{}\n".to_string();
+    }
+    format!("{{\n{}\n}}\n", members.join(",\n"))
+}
+
+/// Build the per-family stats sub-object (input/aggregated/addresses).
+/// Address counts are emitted as strings because IPv6 totals exceed the range
+/// of a JSON-safe integer.
+fn json_family_stats(key: &str, input: usize, aggregated: usize, addresses: &str) -> String {
+    let inner = vec![
+        json_num_member("input", input as u64, 3),
+        json_num_member("aggregated", aggregated as u64, 3),
+        json_str_member("addresses", addresses, 3),
+    ];
+    json_object_member(key, &inner, 2)
 }
 
 // ---------------------------------------------------------------------------
@@ -1211,6 +1417,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     }
 
+    // Validate output formats are mutually exclusive
+    let fmt_count =
+        [cli.output_range, cli.output_netmask, cli.output_wildcard].iter().filter(|&&b| b).count();
+    if fmt_count > 1 {
+        eprintln!(
+            "error: --output-range, --output-netmask, and --output-wildcard are mutually exclusive"
+        );
+        std::process::exit(1);
+    }
+
     // Validate --delimiter and --fields must be used together
     if cli.delimiter.is_some() != cli.fields.is_some() {
         eprintln!("error: --delimiter and --fields must be specified together");
@@ -1273,6 +1489,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let accept_v4 = cli.accept_v4();
     let accept_v6 = cli.accept_v6();
 
+    // Resolve output format (flags already validated as mutually exclusive).
+    let out_fmt = if cli.output_range {
+        OutputFormat::Range
+    } else if cli.output_netmask {
+        OutputFormat::Netmask
+    } else if cli.output_wildcard {
+        OutputFormat::Wildcard
+    } else {
+        OutputFormat::Cidr
+    };
+
     // -----------------------------------------------------------------------
     // Diff mode — compare two files
     // -----------------------------------------------------------------------
@@ -1327,11 +1554,51 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let mut stdout = io::stdout().lock();
 
+        if cli.json {
+            // JSON diff: removed/added per family, with optional per-file stats.
+            let (rem4, add4) = diff_collect(&old_v4, &new_v4);
+            let (rem6, add6) = diff_collect(&old_v6, &new_v6);
+
+            let mut members = vec![
+                json_array_member("removed4", &format_blocks(&rem4, out_fmt), 1),
+                json_array_member("added4", &format_blocks(&add4, out_fmt), 1),
+                json_array_member("removed6", &format_blocks(&rem6, out_fmt), 1),
+                json_array_member("added6", &format_blocks(&add6, out_fmt), 1),
+            ];
+
+            if cli.stats {
+                let old_inner = vec![
+                    json_str_member("file", &cli.input[0], 3),
+                    json_num_member("lines", old.total_lines as u64, 3),
+                    json_num_member("invalid", old.invalid_lines as u64, 3),
+                    json_num_member("utf8_errors", old.utf8_invalid_lines as u64, 3),
+                    json_num_member("ipv4", old_v4.len() as u64, 3),
+                    json_num_member("ipv6", old_v6.len() as u64, 3),
+                ];
+                let new_inner = vec![
+                    json_str_member("file", &cli.input[1], 3),
+                    json_num_member("lines", new.total_lines as u64, 3),
+                    json_num_member("invalid", new.invalid_lines as u64, 3),
+                    json_num_member("utf8_errors", new.utf8_invalid_lines as u64, 3),
+                    json_num_member("ipv4", new_v4.len() as u64, 3),
+                    json_num_member("ipv6", new_v6.len() as u64, 3),
+                ];
+                let stats_inner = vec![
+                    json_object_member("old", &old_inner, 2),
+                    json_object_member("new", &new_inner, 2),
+                ];
+                members.push(json_object_member("stats", &stats_inner, 1));
+            }
+
+            let _ = write!(stdout, "{}", json_document(&members));
+            return Ok(());
+        }
+
         if accept_v4 {
-            diff_sorted(&old_v4, &new_v4, &mut stdout);
+            diff_sorted(&old_v4, &new_v4, out_fmt, &mut stdout);
         }
         if accept_v6 {
-            diff_sorted(&old_v6, &new_v6, &mut stdout);
+            diff_sorted(&old_v6, &new_v6, out_fmt, &mut stdout);
         }
 
         if cli.stats {
@@ -1475,11 +1742,50 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Output aggregated netblocks to stdout
     let mut stdout = io::stdout().lock();
 
+    if cli.json {
+        // JSON: results4 / results6 arrays, plus an optional separate stats object.
+        let results4 = if accept_v4 { format_blocks(&result_v4, out_fmt) } else { Vec::new() };
+        let results6 = if accept_v6 { format_blocks(&result_v6, out_fmt) } else { Vec::new() };
+
+        let mut members = vec![
+            json_array_member("results4", &results4, 1),
+            json_array_member("results6", &results6, 1),
+        ];
+
+        if cli.stats {
+            let mut stats_inner = vec![
+                json_num_member("lines", parsed.total_lines as u64, 2),
+                json_num_member("invalid", parsed.invalid_lines as u64, 2),
+                json_num_member("utf8_errors", parsed.utf8_invalid_lines as u64, 2),
+            ];
+            if accept_v4 {
+                stats_inner.push(json_family_stats(
+                    "ipv4",
+                    v4_before,
+                    result_v4.len(),
+                    &total_addresses_string(&result_v4),
+                ));
+            }
+            if accept_v6 {
+                stats_inner.push(json_family_stats(
+                    "ipv6",
+                    v6_before,
+                    result_v6.len(),
+                    &total_addresses_string(&result_v6),
+                ));
+            }
+            members.push(json_object_member("stats", &stats_inner, 1));
+        }
+
+        let _ = write!(stdout, "{}", json_document(&members));
+        return Ok(());
+    }
+
     if accept_v4 {
-        write_netblocks(&result_v4, cli.output_range, &mut stdout);
+        write_netblocks(&result_v4, out_fmt, &mut stdout);
     }
     if accept_v6 {
-        write_netblocks(&result_v6, cli.output_range, &mut stdout);
+        write_netblocks(&result_v6, out_fmt, &mut stdout);
     }
 
     // Print statistics to stderr if requested
@@ -1496,7 +1802,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "IPv4: {} -> {} aggregated ({} addresses)",
                 v4_before,
                 result_v4.len(),
-                format_count(total_addresses(&result_v4))
+                total_addresses_string(&result_v4)
             );
         }
         if accept_v6 {
@@ -1505,7 +1811,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "IPv6: {} -> {} aggregated ({} addresses)",
                 v6_before,
                 result_v6.len(),
-                format_count(total_addresses(&result_v6))
+                total_addresses_string(&result_v6)
             );
         }
     }
